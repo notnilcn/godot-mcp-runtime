@@ -89,6 +89,10 @@ export function createFakeRunner(options: FakeRunnerOptions = {}): FakeRunner {
       others: fake.extraLiveSessionPaths.map((path) => liveSessionInfo(path)),
     })),
     otherLiveSessions: [] as BridgeOwnerInfo[],
+    // The fake starts no process, so no session reference has a pid.
+    pidOf(): number | null {
+      return null;
+    },
     otherLiveSessionsOnProject(_projectPath: string): BridgeOwnerInfo[] {
       return fake.otherLiveSessions;
     },

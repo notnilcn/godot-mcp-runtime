@@ -61,6 +61,8 @@ Think of it as [Playwright MCP](https://github.com/microsoft/playwright-mcp), bu
 
 **Render check.** `render_movie` renders a fixed number of frames in a separate short Godot run under the engine's movie writer and reports what rendered: blank or not, moving or not. It injects no bridge, simulates no input and starts no session, so it works as a cheap checkpoint before a full `run_project`. It needs a display, asks for the same launch confirmation as `run_project`, and is refused while a runtime session is live on the same project.
 
+**Several run instances of one project.** `run_project` with `instance` starts another copy of the same project beside the first, like the editor's Debug > Customize Run Instances > Enable Multiple Instances. Without `args`, each instance gets the launch arguments and feature tags the editor saved for it in `.godot/editor/project_metadata.cfg`. Every runtime tool takes `instance` to act on one copy, so one agent can drive a client and a server, or two players, through the same bridge model. See [docs/tools.md](docs/tools.md#several-run-instances-of-one-project).
+
 **Several projects at once.** `run_project` on a second project adds a session instead of ending the first, which helps when a game and a small repro project run side by side. The runtime tools act on the current session and name it in every response as `projectPath`; `switch_project` moves them to another one. Nothing falls back silently: if the current session ends, the next call errors and lists the sessions still live. The server runs one runtime operation at a time, so calls issued in parallel wait their turn instead of interleaving.
 
 > [!IMPORTANT]

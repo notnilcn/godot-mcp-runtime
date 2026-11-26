@@ -3,6 +3,7 @@ import {
   findInputCapViolation,
   handleGetDebugOutput,
   parseBridgePortArg,
+  parseInstanceArg,
   parseTimeoutMsArg,
   runtimeToolDefinitions,
 } from '../../src/tools/runtime-tools.js';
@@ -57,7 +58,17 @@ const inputActionProbe =
   (value) =>
     findInputCapViolation([action(value)], []) === null;
 
+const instanceProbe: Probe = (instance) => parseInstanceArg({ instance }).ok;
+
 const PROBES: Record<string, Probe> = {
+  'run_project.instance': instanceProbe,
+  'switch_project.instance': instanceProbe,
+  'get_debug_output.instance': instanceProbe,
+  'stop_project.instance': instanceProbe,
+  'take_screenshot.instance': instanceProbe,
+  'simulate_input.instance': instanceProbe,
+  'get_ui_elements.instance': instanceProbe,
+  'run_script.instance': instanceProbe,
   'get_debug_output.limit': (limit) =>
     !refusalMentions(handleGetDebugOutput(createFakeRunner().asRunner, { limit }), 'limit must'),
   'take_screenshot.timeout': timeoutProbe,

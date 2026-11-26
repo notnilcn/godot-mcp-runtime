@@ -291,6 +291,9 @@ function createRuntimeFake(): RuntimeFake {
         bridgePort: fake.activeBridgePort,
       };
     },
+    pidOf(_ref: unknown): number | null {
+      return null;
+    },
     profilerStreamProblemFor(_ref: unknown): string | null {
       return profilerStreamProblem;
     },

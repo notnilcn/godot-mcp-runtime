@@ -228,13 +228,41 @@ export interface ActionErrorBuckets {
 
 export type RuntimeSessionMode = 'spawned' | 'attached';
 
+/** The project key: one per project directory, shared by every run instance of it. */
 export function sessionKey(projectPath: string): string {
   return projectPathKey(projectPath);
+}
+
+/** The key of one run instance's record. Instance 0 keeps the bare project key, so a single-instance session is keyed as it always was. */
+export function instanceSessionKey(projectPath: string, instance: number = 0): string {
+  const key = projectPathKey(projectPath);
+  return instance === 0 ? key : `${key}#${instance}`;
+}
+
+/** How a session is named in messages: the path, plus the run instance when it is not the first. */
+export function describeSessionTarget(info: { projectPath: string; instance?: number }): string {
+  return info.instance !== undefined && info.instance > 0
+    ? `${info.projectPath} (instance ${info.instance})`
+    : info.projectPath;
+}
+
+/** Extra launch input for one run instance of a spawned session. */
+export interface SpawnInstanceOptions {
+  /** Run-instance index; several instances of one project run side by side, each with its own record, port and token. */
+  instance?: number;
+  /** Command-line arguments appended after the scene, as Godot's editor appends a run instance's launch arguments. */
+  extraArgs?: readonly string[];
+  /** Environment added to the spawn (GODOT_EDITOR_CUSTOM_FEATURES for an instance's feature tags). */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 /** One runtime session. Exported only so the test helper can type it; handlers use {@link RuntimeSessionInfo}. */
 export interface RuntimeSession {
   readonly key: string;
+  /** `sessionKey` of the project: equal across the run instances of one project. Optional so hand-built literals stay valid; read through `projectKeyOf`. */
+  readonly projectKey?: string;
+  /** Run-instance index; absent means 0. */
+  readonly instance?: number;
   readonly projectPath: string;
   mode: RuntimeSessionMode | null;
   bridgePort: number | null;
@@ -264,6 +292,7 @@ export interface RuntimeSession {
 /** Reference to one session record for a caller acting on it after its own awaits; the current pointer and map may name another by then. */
 export interface SessionRef {
   readonly projectPath: string;
+  readonly instance?: number;
 }
 
 export interface AttachResult {
@@ -291,6 +320,8 @@ export interface ReplacedAttachedSession {
 
 export interface RuntimeSessionInfo {
   projectPath: string;
+  /** Run-instance index (0 for a single-instance session). Optional so hand-built literals stay valid. */
+  instance?: number;
   mode: RuntimeSessionMode | null;
   live: boolean;
   current: boolean;
@@ -326,7 +357,7 @@ const BRIDGE_WAIT_STOPPED: BridgeWaitResult = {
 };
 
 function describeNoLiveCurrent(status: RuntimeSessionStatus): string {
-  const others = status.otherLiveSessions.map((info) => info.projectPath);
+  const others = status.otherLiveSessions.map((info) => describeSessionTarget(info));
   const tail =
     others.length > 0 ? ` Live sessions: ${others.join(', ')}.` : ' No other session is live.';
   return `No current runtime session.${tail}`;
@@ -341,6 +372,11 @@ export class NoLiveCurrentSessionError extends Error {
 }
 
 /** Attached: live until its bridge is seen gone. Spawned: live while its process is tracked and has not exited. */
+/** The project key of a record; a hand-built record without one is keyed by its path. */
+function projectKeyOf(session: RuntimeSession): string {
+  return session.projectKey ?? sessionKey(session.projectPath);
+}
+
 function isSessionLive(session: RuntimeSession): boolean {
   if (session.mode === 'attached') return true;
   if (session.mode === 'spawned') return session.process !== null && !session.process.hasExited;
@@ -1084,9 +1120,10 @@ export class GodotRunner {
     background: boolean = false,
     bridgePort?: number,
     profiling: boolean = false,
+    instanceOptions: SpawnInstanceOptions = {},
   ): Promise<SessionRef> {
     return this.queue.run('run_project', () =>
-      this.startSpawned(projectPath, scene, background, bridgePort, profiling),
+      this.startSpawned(projectPath, scene, background, bridgePort, profiling, instanceOptions),
     );
   }
 
@@ -1096,6 +1133,7 @@ export class GodotRunner {
     background: boolean,
     bridgePort: number | undefined,
     profiling: boolean,
+    instanceOptions: SpawnInstanceOptions = {},
   ): Promise<RuntimeSession> {
     const godotPath = this.godotPath;
     if (!godotPath) {
@@ -1106,7 +1144,9 @@ export class GodotRunner {
 
     // Absolute path: the bridge reports an absolute project_path, and a relative expectedPath fails pollBridge's guard and masks the cause as a timeout.
     projectPath = resolve(projectPath);
-    const key = sessionKey(projectPath);
+    const instance = instanceOptions.instance ?? 0;
+    const key = instanceSessionKey(projectPath, instance);
+    const projectKey = sessionKey(projectPath);
 
     // Phase 1: preconditions. Nothing is stopped, written or spawned.
     if (!checkDisplayAvailable()) {
@@ -1116,7 +1156,8 @@ export class GodotRunner {
       );
     }
     this.assertBridgePortNotHeld(bridgePort, key);
-    this.assertNoMovieRun(key, projectPath);
+    this.assertNoMovieRun(projectKey, projectPath);
+    this.assertNoAttachedSibling(key, projectKey, projectPath);
     const port = bridgePort ?? (await findFreePort());
     const parentWatchPort = await this.parentWatchPort();
     let profiler: DebuggerProfiler | null = null;
@@ -1172,7 +1213,7 @@ export class GodotRunner {
     }
 
     // Phase 3: the new record, its bridge and its process.
-    const session = this.createSession(projectPath, 'spawned');
+    const session = this.createSession(projectPath, 'spawned', instance);
     session.replacedAttached = replacedAttached;
     session.startWarnings = startWarnings;
     session.profiler = profiler;
@@ -1201,6 +1242,12 @@ export class GodotRunner {
         logDebug(`Adding scene parameter: ${scene.resPath}`);
         cmdArgs.push(scene.resPath);
       }
+      // Last, as the editor places a run instance's arguments: they usually open with `--`, after which Godot reads nothing itself.
+      const extraArgs = instanceOptions.extraArgs ?? [];
+      cmdArgs.push(...extraArgs);
+      // The count only: instance arguments can carry credentials.
+      if (extraArgs.length > 0)
+        logDebug(`Instance ${instance}: ${extraArgs.length} launch argument(s)`);
 
       const portSource = bridgePort !== undefined ? 'explicit' : 'auto';
       logDebug(`Running Godot project: ${projectPath} (bridge port ${port}, ${portSource})`);
@@ -1215,6 +1262,7 @@ export class GodotRunner {
           // Spawned sessions only; an attached Godot never gets one.
           ...(parentWatchPort !== null ? { [PARENT_WATCH_PORT_ENV]: String(parentWatchPort) } : {}),
           ...this.strandedSweepEnv(projectPath),
+          ...(instanceOptions.extraEnv ?? {}),
         },
       };
       if (background) {
@@ -1290,6 +1338,48 @@ export class GodotRunner {
     throw new Error(
       `The server is shutting down, so the session on ${projectPath} was not started; nothing was launched.`,
     );
+  }
+
+  /** Refuse a spawned run instance beside this server's live attached session on the project: the attached Godot reads the one shared script that has its port baked in, and a spawned inject rewrites that script. */
+  private assertNoAttachedSibling(key: string, projectKey: string, projectPath: string): void {
+    for (const other of this.sessions.values()) {
+      if (other.key === key || projectKeyOf(other) !== projectKey) continue;
+      if (other.mode !== 'attached' || !isSessionLive(other)) continue;
+      throw new Error(
+        `This server has a live attached session on ${projectPath}, and spawned run instances cannot share a project with it: the attached Godot's bridge script has its port baked in. Nothing was stopped or launched: stop the attached session first.`,
+      );
+    }
+  }
+
+  /** Refuse an attach while other run instances of the project are live: the attach bakes its port into the script they share. */
+  private assertNoLiveSiblingForAttach(key: string, projectPath: string): void {
+    const projectKey = sessionKey(projectPath);
+    for (const other of this.sessions.values()) {
+      if (other.key === key || projectKeyOf(other) !== projectKey || !isSessionLive(other))
+        continue;
+      throw new Error(
+        `Run instance ${other.instance ?? 0} of ${projectPath} is live, and attach mode cannot share a project with spawned run instances: it bakes its port into the bridge script they share. Nothing was stopped or attached: stop the other instances first.`,
+      );
+    }
+  }
+
+  /** True while another record of this server on the same project still holds the shared bridge artifacts, so this record's cleanup must leave them. */
+  private siblingHoldsBridge(session: RuntimeSession): boolean {
+    const projectKey = projectKeyOf(session);
+    for (const other of this.sessions.values()) {
+      if (other === session || other.key === session.key) continue;
+      if (projectKeyOf(other) === projectKey && other.mode !== null) return true;
+    }
+    return false;
+  }
+
+  /** `BridgeManager.cleanup` for one record, skipped while a sibling run instance still uses the artifacts (they share this server's owner file). */
+  private cleanupBridgeFor(session: RuntimeSession): string[] {
+    if (this.siblingHoldsBridge(session)) {
+      logDebug(`Leaving the bridge on ${session.projectPath}: another run instance still uses it`);
+      return [];
+    }
+    return this.bridge.cleanup(session.projectPath);
   }
 
   /** Refuse an explicit bridge port a live session on another project holds; the same project's session is exempt because the start stops it first. */
@@ -1380,9 +1470,15 @@ export class GodotRunner {
     return session.epoch;
   }
 
-  private createSession(projectPath: string, mode: RuntimeSessionMode | null): RuntimeSession {
+  private createSession(
+    projectPath: string,
+    mode: RuntimeSessionMode | null,
+    instance: number = 0,
+  ): RuntimeSession {
     const session: RuntimeSession = {
-      key: sessionKey(projectPath),
+      key: instanceSessionKey(projectPath, instance),
+      projectKey: sessionKey(projectPath),
+      instance,
       projectPath,
       mode,
       bridgePort: null,
@@ -1430,7 +1526,7 @@ export class GodotRunner {
     // Another record took this project; it shares the owner file and removes the artifacts.
     if (this.sessions.has(session.key)) return [];
     try {
-      return this.bridge.cleanup(session.projectPath);
+      return this.cleanupBridgeFor(session);
     } catch (err) {
       logDebug(`Bridge cleanup after a failed start failed (ignored): ${err}`);
       return [`bridge cleanup failed outright (${String(err)})`];
@@ -1463,6 +1559,7 @@ export class GodotRunner {
     const exited = session.process !== null && session.process.hasExited ? session.process : null;
     return {
       projectPath: session.projectPath,
+      instance: session.instance ?? 0,
       mode: session.mode,
       live: isSessionLive(session),
       current: this.current === session,
@@ -1501,7 +1598,7 @@ export class GodotRunner {
     this.releaseSocketOf(session);
     // Nobody waits on this exit, so the cleanup problems are kept for the stop_project that reads them.
     try {
-      session.exitCleanupProblems = this.bridge.cleanup(session.projectPath);
+      session.exitCleanupProblems = this.cleanupBridgeFor(session);
     } catch (err) {
       logDebug(`Bridge cleanup after process exit failed: ${err}`);
       session.exitCleanupProblems = [`bridge cleanup failed outright (${String(err)})`];
@@ -1513,7 +1610,7 @@ export class GodotRunner {
     this.releaseSocketOf(session);
     let problems: string[];
     try {
-      problems = this.bridge.cleanup(session.projectPath);
+      problems = this.cleanupBridgeFor(session);
     } catch (err) {
       logDebug(`Bridge cleanup after attached disconnect failed (ignored): ${err}`);
       problems = [`bridge cleanup failed outright (${String(err)})`];
@@ -1588,6 +1685,7 @@ export class GodotRunner {
     // Phase 1: preconditions. Nothing is stopped or written.
     this.assertBridgePortNotHeld(bridgePort, key);
     this.assertNoMovieRun(key, projectPath);
+    this.assertNoLiveSiblingForAttach(key, projectPath);
     const port = bridgePort ?? (await findFreePort());
     this.assertNotShuttingDown(projectPath);
     this.repairStrandedBridge(projectPath);
@@ -1683,6 +1781,13 @@ export class GodotRunner {
     return this.stopSession(session);
   }
 
+  /** Stop one run instance's session now, current or not, without waiting in the queue; null when it has none. `current` is left empty only when it pointed at this one. */
+  stopInstance(projectPath: string, instance: number): Promise<RuntimeStopResult | null> {
+    const session = this.sessions.get(instanceSessionKey(resolve(projectPath), instance));
+    if (!session) return Promise.resolve(null);
+    return this.stopSession(session);
+  }
+
   private recordOf(ref: SessionRef): RuntimeSession {
     if (!this.knownSessions.has(ref)) {
       throw new Error('Not a session reference from this runner');
@@ -1693,6 +1798,11 @@ export class GodotRunner {
   /** Snapshot of the record a reference names, registered or not. */
   describeSessionRef(ref: SessionRef): RuntimeSessionInfo {
     return this.describeSession(this.recordOf(ref));
+  }
+
+  /** Pid of the referenced record's spawned process; null when it has none. */
+  pidOf(ref: SessionRef): number | null {
+    return this.recordOf(ref).process?.process.pid ?? null;
   }
 
   /** `DebuggerProfiler.streamProblem` for the referenced record. */
@@ -1770,7 +1880,7 @@ export class GodotRunner {
   private cleanupStoppedSession(session: RuntimeSession): string[] {
     const registered = this.sessions.get(session.key);
     if (registered !== undefined && registered !== session) return [];
-    return this.bridge.cleanup(session.projectPath);
+    return this.cleanupBridgeFor(session);
   }
 
   private retireSession(session: RuntimeSession): void {
@@ -1924,9 +2034,24 @@ export class GodotRunner {
     return this.listSessions().filter((info) => info.live);
   }
 
-  getSessionInfo(projectPath: string): RuntimeSessionInfo | null {
-    const session = this.sessions.get(sessionKey(projectPath));
+  getSessionInfo(projectPath: string, instance: number = 0): RuntimeSessionInfo | null {
+    const session = this.sessions.get(instanceSessionKey(projectPath, instance));
     return session ? this.describeSession(session) : null;
+  }
+
+  /** Every run instance's record on a project, lowest instance first. */
+  getProjectSessions(projectPath: string): RuntimeSessionInfo[] {
+    const projectKey = sessionKey(projectPath);
+    return [...this.sessions.values()]
+      .filter((session) => projectKeyOf(session) === projectKey)
+      .sort((a, b) => (a.instance ?? 0) - (b.instance ?? 0))
+      .map((session) => this.describeSession(session));
+  }
+
+  /** A live session on the project, preferring the current one, then the lowest instance; null when none is live. */
+  liveSessionOnProject(projectPath: string): RuntimeSessionInfo | null {
+    const live = this.getProjectSessions(projectPath).filter((info) => info.live);
+    return live.find((info) => info.current) ?? live[0] ?? null;
   }
 
   getCurrentSessionInfo(): RuntimeSessionInfo | null {
@@ -1947,27 +2072,30 @@ export class GodotRunner {
   }
 
   hasLiveSessionOnProject(projectPath: string): boolean {
-    const session = this.sessions.get(sessionKey(projectPath));
-    return session !== undefined && isSessionLive(session);
+    const projectKey = sessionKey(projectPath);
+    for (const session of this.sessions.values()) {
+      if (projectKeyOf(session) === projectKey && isSessionLive(session)) return true;
+    }
+    return false;
   }
 
   /** Make a project's session current and close the bridge socket so the next command dials it; null, changing nothing, when there is none. Works on a retained exited session (`live: false`), which is how its logs are read and freed. */
-  switchSession(projectPath: string): RuntimeSessionInfo | null {
+  switchSession(projectPath: string, instance: number = 0): RuntimeSessionInfo | null {
     // Moving the pointer closes the socket, which would reject a command another call has in flight; switch_project holds the queue around this.
     if (!this.queue.freeOrHeldByCaller()) {
       throw new Error(
         `Cannot switch sessions while ${this.queue.running ?? 'another operation'} is running: call switchSession inside runExclusive.`,
       );
     }
-    const session = this.sessions.get(sessionKey(projectPath));
+    const session = this.sessions.get(instanceSessionKey(projectPath, instance));
     if (!session) return null;
     this.setCurrent(session);
     return this.describeSession(session);
   }
 
   /** Copies of a project's retained stdout/stderr; null when it has no process (attached), so "nothing captured" is never empty logs. */
-  readSessionLogs(projectPath: string): RuntimeSessionLogs | null {
-    const proc = this.sessions.get(sessionKey(projectPath))?.process;
+  readSessionLogs(projectPath: string, instance: number = 0): RuntimeSessionLogs | null {
+    const proc = this.sessions.get(instanceSessionKey(projectPath, instance))?.process;
     if (!proc) return null;
     return {
       output: [...proc.output],

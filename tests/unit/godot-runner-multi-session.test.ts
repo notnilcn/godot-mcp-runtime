@@ -357,6 +357,90 @@ describe('multi-project runtime sessions', () => {
     endMovieRun?.();
   });
 
+  describe('run instances of one project', () => {
+    const PORT_A_INSTANCE_1 = 19976;
+
+    async function startInstance(
+      instance: number,
+      port: number,
+      extraArgs: string[] = [],
+    ): Promise<FakeChildProcess> {
+      const child = makeFakeChildProcess({ exitOnKill: true });
+      queuedChildren.push(child);
+      await runner.runProject(projectA, undefined, false, port, false, { instance, extraArgs });
+      return child;
+    }
+
+    it('runs two instances side by side, each with its own record, port and launch arguments', async () => {
+      const first = await startInstance(0, PORT_A, ['--', '--name=Bob']);
+      const second = await startInstance(1, PORT_A_INSTANCE_1, ['--', '--name=Alice']);
+
+      // Red when a second instance replaces the first, as a re-run of the same project does.
+      expect(first.kill).not.toHaveBeenCalled();
+      expect(second.kill).not.toHaveBeenCalled();
+      expect(
+        runner.getProjectSessions(projectA).map((info) => [info.instance, info.bridgePort]),
+      ).toEqual([
+        [0, PORT_A],
+        [1, PORT_A_INSTANCE_1],
+      ]);
+      expect(runner.getCurrentSessionInfo()).toMatchObject({ instance: 1, current: true });
+      const argsOf = (call: number): string[] => spawnMock.mock.calls[call]![1] as string[];
+      expect(argsOf(0).slice(-2)).toEqual(['--', '--name=Bob']);
+      expect(argsOf(1).slice(-2)).toEqual(['--', '--name=Alice']);
+
+      expect(runner.switchSession(projectA, 0)).toMatchObject({ instance: 0, bridgePort: PORT_A });
+      expect(runner.switchSession(projectA, 2)).toBeNull();
+    });
+
+    it(
+      'keeps the shared bridge while a sibling instance is live, and removes it with the last one',
+      async () => {
+        await startInstance(0, PORT_A);
+        const second = await startInstance(1, PORT_A_INSTANCE_1);
+
+        await runner.stopInstance(projectA, 0);
+
+        // Red when stopping one instance pulls the autoload out from under the other.
+        expect(bridge.cleanupCalls).toEqual([]);
+        expect(runner.hasLiveSessionOnProject(projectA)).toBe(true);
+
+        second.emit('exit', 0);
+
+        expect(bridge.cleanupCalls).toEqual([projectA]);
+        expect(runner.hasLiveSessionOnProject(projectA)).toBe(false);
+      },
+      STOP_CASE_TIMEOUT_MS,
+    );
+
+    it('re-running an instance replaces only that instance', async () => {
+      const first = await startInstance(0, PORT_A);
+      const second = await startInstance(1, PORT_A_INSTANCE_1);
+      await startInstance(1, PORT_A_RERUN);
+
+      expect(first.kill).not.toHaveBeenCalled();
+      expect(second.kill).toHaveBeenCalledTimes(1);
+      expect(runner.getSessionInfo(projectA, 1)).toMatchObject({
+        bridgePort: PORT_A_RERUN,
+        live: true,
+      });
+      expect(runner.getSessionInfo(projectA, 0)).toMatchObject({ bridgePort: PORT_A, live: true });
+    });
+
+    it('refuses an attach beside live spawned instances, and a spawned instance beside an attach', async () => {
+      await startInstance(1, PORT_A_INSTANCE_1);
+      await expect(runner.attachProject(projectA, PORT_A)).rejects.toThrow(
+        /Run instance 1 of .* is live, and attach mode cannot share a project/,
+      );
+
+      await runner.attachProject(projectB, PORT_B);
+      queuedChildren.push(makeFakeChildProcess({ exitOnKill: true }));
+      await expect(
+        runner.runProject(projectB, undefined, false, PORT_C, false, { instance: 1 }),
+      ).rejects.toThrow(/live attached session on .*spawned run instances cannot share/);
+    });
+  });
+
   it('starting a second project keeps the first session running', async () => {
     const childA = await startProject(projectA, PORT_A);
     await startProject(projectB, PORT_B);

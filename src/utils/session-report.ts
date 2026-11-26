@@ -1,5 +1,6 @@
 import {
   CLIENT_REQUEST_TIMEOUT_MS,
+  describeSessionTarget,
   NoLiveCurrentSessionError,
   SessionStoppedError,
   type GodotRunner,
@@ -46,9 +47,19 @@ export function isExitedCurrent(status: RuntimeSessionStatus): boolean {
 }
 
 export function otherLiveSessionsClause(status: RuntimeSessionStatus): string {
-  const paths = status.otherLiveSessions.map((info) => info.projectPath);
+  const sharesProject = (info: RuntimeSessionInfo): boolean =>
+    status.current?.projectPath === info.projectPath ||
+    status.otherLiveSessions.some(
+      (other) => other !== info && other.projectPath === info.projectPath,
+    );
+  // A run instance beside its siblings is named with its index, instance 0 included.
+  const paths = status.otherLiveSessions.map((info) =>
+    sharesProject(info)
+      ? `${info.projectPath} (instance ${info.instance ?? 0})`
+      : describeSessionTarget(info),
+  );
   if (paths.length === 0) return '';
-  return ` Live sessions on other projects, none of which is picked automatically: ${paths.join(', ')}.`;
+  return ` Other live sessions, none of which is picked automatically: ${paths.join(', ')}.`;
 }
 
 /** The error for a runtime tool with no live current session; never picks another, lists them and points at switch_project. */
@@ -267,15 +278,30 @@ export function liveSessionRemedy(
   projectPath: string,
   retryWhat: string,
 ): { note: string; solutions: string[] } {
-  const info = runner.getSessionInfo(projectPath);
+  const live = runner.getProjectSessions(projectPath).filter((each) => each.live);
+  if (live.length > 1) {
+    const indexes = live.map((each) => each.instance ?? 0);
+    const onCurrentProject = live.some((each) => each.current);
+    return {
+      note: ` ${live.length} run instances of it are live (instances ${indexes.join(', ')}).`,
+      solutions: [
+        onCurrentProject
+          ? `Call stop_project with instance set to each of ${indexes.join(', ')}, then retry ${retryWhat}`
+          : `Call switch_project with projectPath "${live[0]!.projectPath}", then stop_project with instance set to each of ${indexes.join(', ')}, then retry ${retryWhat}`,
+      ],
+    };
+  }
+  const info = live[0] ?? runner.getSessionInfo(projectPath);
   if (info === null || info.current) {
     return { note: '', solutions: [`Call stop_project, then retry ${retryWhat}`] };
   }
-  const currentPath = runner.getCurrentSessionInfo()?.projectPath ?? 'no project';
+  const current = runner.getCurrentSessionInfo();
+  const currentPath = current !== null ? describeSessionTarget(current) : 'no project';
+  const instanceClause = (info.instance ?? 0) > 0 ? ` and instance ${info.instance}` : '';
   return {
     note: ` That session is not the current one (the runtime tools point at ${currentPath}), so stop_project by itself would not stop it.`,
     solutions: [
-      `Call switch_project with projectPath "${info.projectPath}", then stop_project, then retry ${retryWhat}`,
+      `Call switch_project with projectPath "${info.projectPath}"${instanceClause}, then stop_project, then retry ${retryWhat}`,
     ],
   };
 }

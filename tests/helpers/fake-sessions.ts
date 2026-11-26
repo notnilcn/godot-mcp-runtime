@@ -67,6 +67,15 @@ export function fakeSessionApi(
       const key = sessionKey(projectPath);
       return listSessions().find((s) => sessionKey(s.projectPath) === key) ?? null;
     },
+    getProjectSessions: (projectPath: string): RuntimeSessionInfo[] => {
+      const key = sessionKey(projectPath);
+      return listSessions().filter((s) => sessionKey(s.projectPath) === key);
+    },
+    liveSessionOnProject: (projectPath: string): RuntimeSessionInfo | null => {
+      const key = sessionKey(projectPath);
+      const live = listSessions().filter((s) => s.live && sessionKey(s.projectPath) === key);
+      return live.find((s) => s.current) ?? live[0] ?? null;
+    },
     getRuntimeSessionStatus: (): RuntimeSessionStatus => {
       const { info, others } = snapshot();
       const otherLiveSessions = others.filter((s) => s.live);

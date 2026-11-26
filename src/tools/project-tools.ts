@@ -147,6 +147,10 @@ export const projectToolDefinitions = [
           properties: {
             activeSession: { type: 'boolean' },
             projectPath: { type: ['string', 'null'] },
+            instance: {
+              type: 'number',
+              description: 'Run instance of the current session; present when it is not 0.',
+            },
             sessionMode: { type: 'string', enum: ['spawned', 'attached'] },
             processExited: { type: 'boolean' },
             exitCode: { type: ['number', 'null'] },
@@ -162,6 +166,7 @@ export const projectToolDefinitions = [
                 type: 'object',
                 properties: {
                   projectPath: { type: 'string' },
+                  instance: { type: 'number' },
                   sessionMode: { type: 'string', enum: ['spawned', 'attached'] },
                   current: { type: 'boolean' },
                   bridgePort: { type: ['number', 'null'] },
@@ -175,8 +180,23 @@ export const projectToolDefinitions = [
                 projectPath: { type: 'string' },
                 session: { type: 'string', enum: ['live', 'exited', 'none'] },
                 current: { type: 'boolean' },
+                instance: { type: 'number' },
                 sessionMode: { type: 'string', enum: ['spawned', 'attached'] },
                 exitCode: { type: ['number', 'null'] },
+                instances: {
+                  type: 'array',
+                  description:
+                    'Every run instance this server holds a session for on the project, when there is more than one.',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      instance: { type: 'number' },
+                      session: { type: 'string', enum: ['live', 'exited'] },
+                      current: { type: 'boolean' },
+                      bridgePort: { type: ['number', 'null'] },
+                    },
+                  },
+                },
               },
               required: ['projectPath', 'session', 'current'],
             },
@@ -784,9 +804,17 @@ export async function handleListProjects(args: OperationParams): Promise<Handler
   }
 }
 
-function describeLiveSession(info: RuntimeSessionInfo): Record<string, unknown> {
+/** `instance` is named for a run instance other than 0, and for every session beside a sibling instance of the same project. */
+function describeLiveSession(
+  info: RuntimeSessionInfo,
+  _index: number,
+  all: readonly RuntimeSessionInfo[],
+): Record<string, unknown> {
+  const instance = info.instance ?? 0;
+  const hasSibling = all.some((other) => other !== info && other.projectPath === info.projectPath);
   return {
     projectPath: info.projectPath,
+    ...(instance > 0 || hasSibling ? { instance } : {}),
     sessionMode: info.mode,
     current: info.current,
     bridgePort: info.bridgePort,
@@ -794,14 +822,30 @@ function describeLiveSession(info: RuntimeSessionInfo): Record<string, unknown> 
 }
 
 function describeProjectSession(runner: GodotRunner, projectPath: string): Record<string, unknown> {
-  const info = runner.getSessionInfo(projectPath);
+  const all = runner.getProjectSessions(projectPath);
+  const info =
+    all.find((candidate) => candidate.current) ??
+    runner.liveSessionOnProject(projectPath) ??
+    all[0] ??
+    null;
   if (info === null) return { projectPath: resolve(projectPath), session: 'none', current: false };
   return {
     projectPath: info.projectPath,
     session: info.live ? 'live' : 'exited',
     current: info.current,
+    ...((info.instance ?? 0) > 0 || all.length > 1 ? { instance: info.instance ?? 0 } : {}),
     ...(info.mode !== null ? { sessionMode: info.mode } : {}),
     ...(info.processExited ? { exitCode: info.exitCode } : {}),
+    ...(all.length > 1
+      ? {
+          instances: all.map((each) => ({
+            instance: each.instance ?? 0,
+            session: each.live ? 'live' : 'exited',
+            current: each.current,
+            bridgePort: each.bridgePort,
+          })),
+        }
+      : {}),
   };
 }
 
@@ -878,6 +922,7 @@ async function describeRuntime(
     );
   }
   runtime.projectPath = current?.projectPath ?? null;
+  if (current !== null && (current.instance ?? 0) > 0) runtime.instance = current.instance;
   const liveSessions = runner.listLiveSessions();
   runtime.liveSessions = liveSessions.map(describeLiveSession);
   if (askedProjectPath !== null) runtime.project = describeProjectSession(runner, askedProjectPath);

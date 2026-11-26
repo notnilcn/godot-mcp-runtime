@@ -71,7 +71,17 @@ import {
   runtimeToolWording,
   type NoSessionWording,
 } from '../utils/session-report.js';
-import { CLIENT_REQUEST_TIMEOUT_MS, sessionKey } from '../utils/godot-runner.js';
+import {
+  CLIENT_REQUEST_TIMEOUT_MS,
+  describeSessionTarget,
+  sessionKey,
+  type RuntimeSessionInfo,
+} from '../utils/godot-runner.js';
+import {
+  readEditorRunInstances,
+  readMainRunArgs,
+  resolveRunInstanceLaunch,
+} from '../utils/run-instances.js';
 
 const SCREENSHOT_RESPONSE_MODES = ['full', 'preview', 'path_only'] as const;
 export const DEFAULT_PREVIEW_MAX_WIDTH = 960;
@@ -135,7 +145,19 @@ const BRIDGE_PORT_MAX = 65535;
 const BACKGROUND_MODE_NOTE =
   'Background mode: window not shown on Windows, moved off-screen elsewhere; mouse input passes through';
 
-const SPAWN_ONLY_RUN_PROJECT_PARAMS = ['scene', 'background', 'profiling'] as const;
+const SPAWN_ONLY_RUN_PROJECT_PARAMS = ['scene', 'background', 'profiling', 'args'] as const;
+
+/** Highest run-instance index accepted; the editor's dialog allows up to 16 instances. */
+export const MAX_RUN_INSTANCE = 15;
+
+/** The `instance` property every runtime tool shares: one run instance of the current session's project. */
+const INSTANCE_TARGET_PROPERTY = {
+  type: 'integer',
+  minimum: 0,
+  maximum: MAX_RUN_INSTANCE,
+  description:
+    "Run instance to act on (the index run_project was given). Omit to act on the current session. When given, that instance of the current session's project becomes the current session first, so later calls without instance act on it too.",
+} as const;
 
 type ScreenshotResponseMode = (typeof SCREENSHOT_RESPONSE_MODES)[number];
 
@@ -212,6 +234,19 @@ export const runtimeToolDefinitions = [
           description:
             "Attach Godot's own remote debugger so profile_project, start_profiler and stop_profiler can measure this session. Must be set at launch - a session already running cannot be profiled - and costs a little runtime overhead. Not valid with attach: true.",
         },
+        instance: {
+          type: 'integer',
+          minimum: 0,
+          maximum: MAX_RUN_INSTANCE,
+          description:
+            "Run instance index, for running several copies of the same project side by side (like the editor's Debug > Customize Run Instances > Enable Multiple Instances). Each instance is its own session with its own process, bridge port and logs; starting an instance replaces only that instance. When given and args is omitted, the instance is launched with the arguments and feature tags the editor saved for it in .godot/editor/project_metadata.cfg, combined with editor/run/main_run_args as the editor does. Omit for a single session (instance 0, no editor arguments). Target an instance later with switch_project or the instance parameter of the runtime tools. Instance 0 only with attach: true.",
+        },
+        args: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Command-line arguments appended after the scene, replacing any editor run-instance arguments. Godot reads user arguments after a "--" element (OS.get_cmdline_user_args). Not valid with attach: true.',
+        },
       },
       required: ['projectPath'],
     },
@@ -220,8 +255,23 @@ export const runtimeToolDefinitions = [
       properties: {
         warnings: { type: 'array', items: { type: 'string' } },
         projectPath: { type: 'string' },
+        instance: { type: 'number' },
         sessionMode: { type: 'string', enum: ['spawned', 'attached'] },
         bridgePort: { type: 'number' },
+        pid: { type: 'number', description: 'Process id of the spawned Godot.' },
+        launchArgsSource: {
+          type: 'string',
+          enum: ['none', 'args', 'editor-run-instance'],
+          description:
+            'Where the extra launch arguments came from. Their values are not echoed, since editor run arguments can carry credentials.',
+        },
+        launchArgCount: { type: 'number' },
+        featureTags: { type: 'array', items: { type: 'string' } },
+        editorInstanceCount: {
+          type: ['number', 'null'],
+          description:
+            'How many instances the editor runs (run_instance_count when multiple instances are enabled, else 1); null when the editor saved no run-instance settings.',
+        },
         message: { type: 'string' },
       },
       required: ['projectPath', 'sessionMode', 'bridgePort', 'message'],
@@ -240,6 +290,13 @@ export const runtimeToolDefinitions = [
           description:
             'Path to the Godot project directory whose session becomes the current one. check_project lists the live sessions.',
         },
+        instance: {
+          type: 'integer',
+          minimum: 0,
+          maximum: MAX_RUN_INSTANCE,
+          description:
+            'Run instance of that project to select (the index run_project was given). Default 0.',
+        },
       },
       required: ['projectPath'],
     },
@@ -248,7 +305,9 @@ export const runtimeToolDefinitions = [
       properties: {
         warnings: { type: 'array', items: { type: 'string' } },
         projectPath: { type: 'string' },
+        instance: { type: 'number' },
         previousProjectPath: { type: ['string', 'null'] },
+        previousInstance: { type: ['number', 'null'] },
         live: { type: 'boolean' },
         sessionMode: { type: ['string', 'null'], enum: ['spawned', 'attached', null] },
         bridgePort: { type: ['number', 'null'] },
@@ -280,6 +339,11 @@ export const runtimeToolDefinitions = [
           minimum: MIN_DEBUG_OUTPUT_LIMIT,
           description: `Max lines to return, a whole number of ${MIN_DEBUG_OUTPUT_LIMIT} or more (default: ${DEFAULT_DEBUG_OUTPUT_LIMIT}, from end of output)`,
         },
+        instance: {
+          ...INSTANCE_TARGET_PROPERTY,
+          description:
+            "Run instance of the current session's project whose logs to read. Omit for the current session. Does not change the current session.",
+        },
       },
       required: [],
     },
@@ -288,6 +352,7 @@ export const runtimeToolDefinitions = [
       properties: {
         warnings: { type: 'array', items: { type: 'string' } },
         projectPath: { type: 'string' },
+        instance: { type: 'number' },
         sessionMode: { type: 'string', enum: ['spawned', 'attached'] },
         output: {
           type: ['array', 'null'],
@@ -313,7 +378,13 @@ export const runtimeToolDefinitions = [
     annotations: { destructiveHint: true },
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        instance: {
+          ...INSTANCE_TARGET_PROPERTY,
+          description:
+            "Run instance of the current session's project to stop. Omit to stop the current session. Stopping a non-current instance leaves the current session as it is.",
+        },
+      },
       required: [],
     },
     outputSchema: {
@@ -321,6 +392,7 @@ export const runtimeToolDefinitions = [
       properties: {
         warnings: { type: 'array', items: { type: 'string' } },
         projectPath: { type: 'string' },
+        instance: { type: 'number' },
         message: { type: 'string' },
         sessionMode: { type: 'string', enum: ['spawned', 'attached'] },
         externalProcessPreserved: { type: 'boolean' },
@@ -363,6 +435,7 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        instance: INSTANCE_TARGET_PROPERTY,
         timeout: {
           type: 'integer',
           minimum: MIN_RUNTIME_TIMEOUT_MS,
@@ -390,6 +463,7 @@ export const runtimeToolDefinitions = [
       type: 'object',
       properties: {
         projectPath: { type: 'string' },
+        instance: { type: 'number' },
         responseMode: { type: 'string' },
         path: { type: 'string' },
         size: {
@@ -432,6 +506,7 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        instance: INSTANCE_TARGET_PROPERTY,
         actions: {
           type: 'array',
           description: `Array of input actions to execute sequentially. Each object must have a "type" field. A batch whose time budget (waits, holds, and every frame counted at 10fps) exceeds ${MAX_INPUT_BATCH_BUDGET_MS / MS_PER_SECOND}s is rejected before anything is injected: split it across calls. ${ACTIONS_PER_CALL_SENTENCE} When results outgrow one reply (about 4 MiB), later entries keep only index, type, ok, frame, elapsed_ms and error, with details_dropped: true; the action still ran.`,
@@ -555,6 +630,7 @@ export const runtimeToolDefinitions = [
             'Present when the per-action errors could not be attributed completely: some may sit on the wrong entry or be missing.',
         },
         projectPath: { type: 'string' },
+        instance: { type: 'number' },
         success: {
           type: 'boolean',
           description: 'False when an action failed and the remaining actions were skipped.',
@@ -644,6 +720,7 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        instance: INSTANCE_TARGET_PROPERTY,
         visibleOnly: {
           type: 'boolean',
           description:
@@ -666,6 +743,7 @@ export const runtimeToolDefinitions = [
       type: 'object',
       properties: {
         projectPath: { type: 'string' },
+        instance: { type: 'number' },
         elements: {
           type: 'array',
           items: {
@@ -721,6 +799,7 @@ export const runtimeToolDefinitions = [
     inputSchema: {
       type: 'object',
       properties: {
+        instance: INSTANCE_TARGET_PROPERTY,
         script: {
           type: 'string',
           description:
@@ -739,6 +818,7 @@ export const runtimeToolDefinitions = [
       type: 'object',
       properties: {
         projectPath: { type: 'string' },
+        instance: { type: 'number' },
         result: {
           description:
             'The value execute returned. Vector2, Vector3 and Vector4 (and their int forms) are {x, y[, z, w]}, Color is {r, g, b, a}, and a packed array is a plain array of its elements, the shapes get_node_properties returns. A non-finite number (INF, NAN) is null and counted in warnings. Rect2, Quaternion, transforms and other types without a shape of their own are their text form (null and counted when a component is non-finite). A Node is {class, name, path}, a Resource {class, path}, another Object its text, a freed Object "<Freed Object>".',
@@ -823,15 +903,214 @@ function buildRunProjectResponse(session: {
   bridgePort: number;
   warnings: readonly string[];
   message: string;
+  launch?: InstanceLaunchPlan;
+  pid?: number;
 }): HandlerResult {
   const warnings = [...session.warnings];
+  const launch = session.launch;
   return createStructuredResponse({
     ...(warnings.length > 0 ? { warnings } : {}),
     projectPath: resolve(session.projectPath),
+    ...(launch !== undefined ? { instance: launch.instance } : {}),
     sessionMode: session.sessionMode,
     bridgePort: session.bridgePort,
+    ...(session.pid !== undefined ? { pid: session.pid } : {}),
+    ...(launch !== undefined
+      ? {
+          launchArgsSource: launch.source,
+          launchArgCount: launch.args.length,
+          featureTags: launch.featureTags,
+          editorInstanceCount: launch.editorInstanceCount,
+        }
+      : {}),
     message: session.message,
   });
+}
+
+/** What one spawned run instance is launched with; `args` is never echoed, since editor run arguments can carry credentials. */
+interface InstanceLaunchPlan {
+  instance: number;
+  source: 'none' | 'args' | 'editor-run-instance';
+  args: string[];
+  featureTags: string[];
+  /** Instances the editor runs, or null when it saved no run-instance settings. */
+  editorInstanceCount: number | null;
+  warnings: string[];
+}
+
+export function parseInstanceArg(args: OperationParams): Result<number | undefined, ToolResponse> {
+  const instance = optionalNumber(args, 'instance');
+  if (!instance.ok) return instance;
+  if (
+    instance.value !== undefined &&
+    (!Number.isInteger(instance.value) || instance.value < 0 || instance.value > MAX_RUN_INSTANCE)
+  ) {
+    return err(
+      createErrorResponse(
+        `Invalid instance: must be an integer from 0 to ${MAX_RUN_INSTANCE} (got: ${String(instance.value)})`,
+        [
+          'Pass the run-instance index, 0 for the first instance',
+          'Omit instance for a single session',
+        ],
+      ),
+    );
+  }
+  return instance;
+}
+
+/** The launch plan for a spawned start: explicit `args` win; an explicit `instance` takes the editor's saved run-instance settings; otherwise nothing is added, as before run instances existed. */
+function planInstanceLaunch(
+  projectPath: string,
+  args: OperationParams,
+): Result<InstanceLaunchPlan, ToolResponse> {
+  const instance = parseInstanceArg(args);
+  if (!instance.ok) return instance;
+  const explicitArgs = optionalStringArray(args, 'args');
+  if (!explicitArgs.ok) return explicitArgs;
+  const index = instance.value ?? 0;
+
+  let config: ReturnType<typeof readEditorRunInstances>;
+  try {
+    config = readEditorRunInstances(projectPath);
+  } catch (error: unknown) {
+    if (explicitArgs.value !== undefined || instance.value === undefined) config = null;
+    else {
+      return err(
+        createErrorResponse(
+          `Could not read the editor's run-instance settings: ${getErrorMessage(error)}`,
+          [
+            'Pass args to give this instance its launch arguments directly',
+            'Or open Debug > Customize Run Instances in the editor and save the settings again',
+          ],
+        ),
+      );
+    }
+  }
+  const editorInstanceCount =
+    config === null ? null : config.multipleInstancesEnabled ? config.instanceCount : 1;
+
+  if (explicitArgs.value !== undefined) {
+    return ok({
+      instance: index,
+      source: 'args',
+      args: [...explicitArgs.value],
+      featureTags: [],
+      editorInstanceCount,
+      warnings: [],
+    });
+  }
+  if (instance.value === undefined) {
+    return ok({
+      instance: 0,
+      source: 'none',
+      args: [],
+      featureTags: [],
+      editorInstanceCount,
+      warnings: [],
+    });
+  }
+  const launch = resolveRunInstanceLaunch(index, config, readMainRunArgs(projectPath));
+  return ok({
+    instance: index,
+    source:
+      launch.args.length > 0 || launch.featureTags.length > 0 ? 'editor-run-instance' : 'none',
+    args: launch.args,
+    featureTags: launch.featureTags,
+    editorInstanceCount,
+    warnings: launch.warnings,
+  });
+}
+
+/** The project a per-call `instance` refers to: the current session's, or the one project every session belongs to. */
+function instanceTargetProject(runner: GodotRunner): Result<string, ToolResponse> {
+  const current = runner.getCurrentSessionInfo();
+  if (current !== null) return ok(current.projectPath);
+  const projects = [...new Set(runner.listSessions().map((info) => sessionKey(info.projectPath)))];
+  const first = runner.listSessions()[0];
+  if (projects.length === 1 && first !== undefined) return ok(first.projectPath);
+  return err(
+    createErrorResponse(
+      projects.length === 0
+        ? 'No runtime session exists, so there is no run instance to select.'
+        : 'No session is current and sessions exist on several projects, so instance alone does not say which project is meant.',
+      [
+        'Call switch_project with projectPath and instance',
+        'Or call run_project with instance to start one',
+      ],
+    ),
+  );
+}
+
+function noSuchInstanceError(
+  runner: GodotRunner,
+  projectPath: string,
+  instance: number,
+): ToolResponse {
+  const sessions = runner.getProjectSessions(projectPath);
+  const known =
+    sessions.length > 0
+      ? ` Its sessions: ${sessions.map((info) => `instance ${info.instance ?? 0}${info.live ? '' : ' (not live)'}`).join(', ')}.`
+      : '';
+  return createErrorResponse(
+    `No runtime session for instance ${instance} of ${projectPath}: this server has not started one, or it was stopped.${known}`,
+    [`Call run_project with projectPath "${projectPath}" and instance ${instance} to start it`],
+  );
+}
+
+/** Inside a call's queue turn: make the run instance it names current, so the command goes to that instance. Ok(null) when the call names none. */
+function selectInstanceTarget(
+  runner: GodotRunner,
+  args: OperationParams,
+): Result<number | null, ToolResponse> {
+  const instance = parseInstanceArg(normalizeParameters(args));
+  if (!instance.ok) return instance;
+  if (instance.value === undefined) return ok(null);
+  const project = instanceTargetProject(runner);
+  if (!project.ok) return project;
+  const selected = runner.switchSession(project.value, instance.value);
+  if (selected === null) return err(noSuchInstanceError(runner, project.value, instance.value));
+  return ok(instance.value);
+}
+
+/** Runs a runtime tool's body on the run instance its `instance` argument names, selected inside the same queue turn so a parallel call cannot redirect it; the payload then carries `instance`. */
+async function onInstanceTarget(
+  runner: GodotRunner,
+  args: OperationParams,
+  operation: () => Promise<HandlerResult>,
+): Promise<HandlerResult> {
+  const selected = selectInstanceTarget(runner, args);
+  if (!selected.ok) return selected;
+  const result = await operation();
+  const instance = runner.getCurrentSessionInfo()?.instance;
+  if (selected.value === null && (instance === undefined || instance === 0)) return result;
+  return tagWithInstance(result, instance ?? 0);
+}
+
+/** Adds `instance` after `projectPath` in a structured success payload and its JSON text block. */
+function tagWithInstance(result: HandlerResult, instance: number): HandlerResult {
+  if (!result.ok) return result;
+  const response = result.value;
+  const payload = response.structuredContent;
+  if (payload === undefined || payload === null || typeof payload !== 'object') return result;
+  if (!('projectPath' in payload)) return result;
+  const tagged: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(payload)) {
+    tagged[k] = v;
+    if (k === 'projectPath') tagged.instance = instance;
+  }
+  const content = response.content.map((block) => {
+    if (block.type !== 'text' || typeof block.text !== 'string') return block;
+    try {
+      const parsed: unknown = JSON.parse(block.text);
+      if (parsed !== null && typeof parsed === 'object' && 'projectPath' in parsed) {
+        return { ...block, text: JSON.stringify(tagged) };
+      }
+    } catch {
+      // Not the payload block.
+    }
+    return block;
+  });
+  return ok({ ...response, content, structuredContent: tagged });
 }
 
 const REPLACED_ATTACHED_NOTE =
@@ -885,11 +1164,25 @@ function rejectSpawnOnlyParams(args: OperationParams): ToolResponse | null {
   if (!background.ok) return background.error;
   const profiling = optionalBoolean(args, 'profiling');
   if (!profiling.ok) return profiling.error;
+  const launchArgs = optionalStringArray(args, 'args');
+  if (!launchArgs.ok) return launchArgs.error;
+  const instance = parseInstanceArg(args);
+  if (!instance.ok) return instance.error;
+  if (instance.value !== undefined && instance.value > 0) {
+    return createErrorResponse(
+      'attach: true uses run instance 0 only: an attached Godot reads a bridge script with its port baked in, and run instances share that script.',
+      [
+        'Remove instance (or pass 0) to attach',
+        'Remove attach to let run_project spawn the run instance',
+      ],
+    );
+  }
 
   const requested: Record<(typeof SPAWN_ONLY_RUN_PROJECT_PARAMS)[number], boolean> = {
     scene: scene.value !== undefined,
     background: background.value === true,
     profiling: profiling.value === true,
+    args: launchArgs.value !== undefined,
   };
   for (const param of SPAWN_ONLY_RUN_PROJECT_PARAMS) {
     if (requested[param]) {
@@ -1012,6 +1305,9 @@ async function startSpawnedSession(
   if (!profiling.ok) return profiling;
   const isProfiling = profiling.value === true;
 
+  const launchPlan = planInstanceLaunch(projectPath, args);
+  if (!launchPlan.ok) return launchPlan;
+
   // Everything that can say no precedes the confirmation, which prompts a human: an impossible launch must never ask or record confirmation.
   if (!runner.getGodotPath()) {
     await runner.detectGodotPath();
@@ -1057,6 +1353,7 @@ async function startSpawnedSession(
         background: isBackground,
         bridgePort: bridgePort.value,
         profiling: isProfiling,
+        launch: launchPlan.value,
       }),
     promptMs,
   );
@@ -1072,10 +1369,12 @@ async function launchSpawnedSession(
     background: boolean;
     bridgePort: number | undefined;
     profiling: boolean;
+    launch: InstanceLaunchPlan;
   },
 ): Promise<HandlerResult> {
   const isBackground = opts.background;
   const isProfiling = opts.profiling;
+  const launch = opts.launch;
   try {
     const started = await runner.runProject(
       projectPath,
@@ -1083,6 +1382,15 @@ async function launchSpawnedSession(
       isBackground,
       opts.bridgePort,
       isProfiling,
+      {
+        instance: launch.instance,
+        extraArgs: launch.args,
+        // How the editor hands an instance its feature tags; a debug build answers OS.has_feature for them.
+        extraEnv:
+          launch.featureTags.length > 0
+            ? { GODOT_EDITOR_CUSTOM_FEATURES: launch.featureTags.join(',') }
+            : {},
+      },
     );
 
     // Before the wait: every outcome must say what happened to the replaced session, failures included.
@@ -1175,6 +1483,16 @@ async function launchSpawnedSession(
       message += ' Profiling enabled: use profile_project or start_profiler.';
     }
     message += replaced.messageNote;
+    if (launch.instance > 0 || launch.source !== 'none') {
+      const others = runner
+        .getProjectSessions(projectPath)
+        .filter((info) => info.live && (info.instance ?? 0) !== launch.instance)
+        .map((info) => info.instance ?? 0);
+      message += ` Run instance ${launch.instance}${launch.source === 'none' ? '' : ` launched with ${launch.args.length} argument(s) from ${launch.source === 'args' ? 'args' : "the editor's run-instance settings"}`}.`;
+      if (others.length > 0) {
+        message += ` Other live instances of this project: ${others.join(', ')}; pass instance to a runtime tool, or switch_project, to act on one.`;
+      }
+    }
     // Null this early is not a clean bill: the engine may have sent nothing yet.
     const streamProblem = isProfiling ? runner.profilerStreamProblemFor(started) : null;
     return buildRunProjectResponse({
@@ -1183,11 +1501,14 @@ async function launchSpawnedSession(
       bridgePort: readyPort,
       warnings: [
         ...(streamProblem !== null ? [streamProblem] : []),
+        ...launch.warnings,
         ...startWarnings,
         ...replaced.warnings,
         ...warnings,
       ],
       message,
+      launch,
+      ...(runner.pidOf(started) !== null ? { pid: runner.pidOf(started)! } : {}),
     });
   } catch (error: unknown) {
     const errorMessage = getErrorMessage(error);
@@ -1414,16 +1735,29 @@ export async function handleSwitchProject(
   const parsed = parseProjectArgs(args);
   if (!parsed.ok) return parsed;
   const target = resolve(parsed.value.projectPath);
+  const instance = parseInstanceArg(args);
+  if (!instance.ok) return instance;
+  const index = instance.value ?? 0;
 
   // Moving the pointer closes the bridge socket, which must not happen under a command another call has in flight.
-  return runSessionExclusive(runner, 'switch_project', () => switchToSession(runner, target));
+  return runSessionExclusive(runner, 'switch_project', () =>
+    switchToSession(runner, target, index),
+  );
 }
 
-async function switchToSession(runner: GodotRunner, target: string): Promise<HandlerResult> {
-  const previousProjectPath = runner.getCurrentSessionInfo()?.projectPath ?? null;
-  const session = runner.switchSession(target);
+async function switchToSession(
+  runner: GodotRunner,
+  target: string,
+  instance: number,
+): Promise<HandlerResult> {
+  const previous = runner.getCurrentSessionInfo();
+  const previousProjectPath = previous?.projectPath ?? null;
+  const session = runner.switchSession(target, instance);
+  if (session === null && runner.getProjectSessions(target).length > 0) {
+    return err(noSuchInstanceError(runner, target, instance));
+  }
   if (session === null) {
-    const live = runner.listLiveSessions().map((info) => info.projectPath);
+    const live = runner.listLiveSessions().map((info) => describeSessionTarget(info));
     const liveClause =
       live.length > 0 ? ` Live sessions: ${live.join(', ')}.` : ' No session is live.';
     return err(
@@ -1466,17 +1800,22 @@ async function switchToSession(runner: GodotRunner, target: string): Promise<Han
     );
   }
 
+  const label = describeSessionTarget(session);
   const message =
-    previousProjectPath === session.projectPath
-      ? `${session.projectPath} was already the current session.`
+    previous !== null &&
+    previous.projectPath === session.projectPath &&
+    previous.instance === session.instance
+      ? `${label} was already the current session.`
       : session.live
-        ? `Runtime tools now act on ${session.projectPath}.`
-        : `Selected ${session.projectPath}; its session is not live.`;
+        ? `Runtime tools now act on ${label}.`
+        : `Selected ${label}; its session is not live.`;
 
   return createStructuredResponse({
     ...(warnings.length > 0 ? { warnings } : {}),
     projectPath: session.projectPath,
+    instance: session.instance ?? 0,
     previousProjectPath,
+    previousInstance: previous === null ? null : (previous.instance ?? 0),
     live: session.live,
     sessionMode: session.mode,
     bridgePort: session.bridgePort,
@@ -1531,10 +1870,19 @@ export function handleGetDebugOutput(
   args = normalizeParameters(args);
   const limitResult = parseIntegerRangeArg(args, 'limit', { min: MIN_DEBUG_OUTPUT_LIMIT });
   if (!limitResult.ok) return limitResult;
+  const instanceArg = parseInstanceArg(args);
+  if (!instanceArg.ok) return instanceArg;
 
   // The mode is nulled when a spawned process exits but its logs live on: gate on the current record, not a live session.
   const status = runner.getRuntimeSessionStatus();
-  const current = status.current;
+  let current: RuntimeSessionInfo | null = status.current;
+  if (instanceArg.value !== undefined) {
+    // Read in place: this call is not queued, so it never moves the current pointer.
+    const project = instanceTargetProject(runner);
+    if (!project.ok) return project;
+    current = runner.getSessionInfo(project.value, instanceArg.value);
+    if (current === null) return err(noSuchInstanceError(runner, project.value, instanceArg.value));
+  }
   if (current === null || (current.mode === null && !current.hasRetainedLogs)) {
     return err(
       noLiveCurrentSessionError(status, {
@@ -1549,11 +1897,15 @@ export function handleGetDebugOutput(
     );
   }
 
+  const targetInstance = current.instance ?? 0;
+  const instanceField =
+    targetInstance > 0 || instanceArg.value !== undefined ? { instance: targetInstance } : {};
   if (current.mode === 'attached') {
     // Nothing captured is not nothing printed: an empty `errors` would read as no errors, so both are null and the reason leads.
     return createStructuredResponse({
       warnings: [attachedNothingCapturedWarning('output', 'errors')],
       projectPath: current.projectPath,
+      ...instanceField,
       sessionMode: 'attached',
       output: null,
       errors: null,
@@ -1561,7 +1913,11 @@ export function handleGetDebugOutput(
     });
   }
 
-  const proc = runner.activeProcess;
+  // A named instance is read by key; the current one through its live process.
+  const proc =
+    instanceArg.value === undefined
+      ? runner.activeProcess
+      : runner.readSessionLogs(current.projectPath, targetInstance);
   if (!proc) {
     return err(
       createErrorResponse('No active spawned process is available for debug output.', [
@@ -1574,6 +1930,7 @@ export function handleGetDebugOutput(
   const limit = limitResult.value ?? DEFAULT_DEBUG_OUTPUT_LIMIT;
   const response: {
     projectPath: string;
+    instance?: number;
     sessionMode: 'spawned';
     output: string[];
     errors: string[];
@@ -1582,6 +1939,7 @@ export function handleGetDebugOutput(
     tip?: string;
   } = {
     projectPath: current.projectPath,
+    ...instanceField,
     // Only a spawned session has a process, even after the exit cleared its mode.
     sessionMode: 'spawned',
     output: proc.output.slice(-limit),
@@ -1606,14 +1964,46 @@ export function handleGetDebugOutput(
   return createStructuredResponse(response);
 }
 
-export function handleStopProject(runner: GodotRunner): Promise<HandlerResult> {
+export async function handleStopProject(
+  runner: GodotRunner,
+  args: OperationParams = {},
+): Promise<HandlerResult> {
   // Not queued: a stop cuts off the running runtime call, which fails saying so; waiting would leave a wedged game unstoppable for that call's timeout.
-  return stopCurrentSession(runner);
+  const instanceArg = parseInstanceArg(normalizeParameters(args));
+  if (!instanceArg.ok) return instanceArg;
+  if (instanceArg.value === undefined) return stopCurrentSession(runner);
+  // The record is resolved directly: switchSession needs the queue, which a stop never waits for.
+  const project = instanceTargetProject(runner);
+  if (!project.ok) return project;
+  const target = runner.getSessionInfo(project.value, instanceArg.value);
+  if (target === null) return err(noSuchInstanceError(runner, project.value, instanceArg.value));
+  const stopped = await stopCurrentSession(runner, {
+    projectPath: project.value,
+    instance: instanceArg.value,
+  });
+  return tagWithInstance(stopped, instanceArg.value);
 }
 
-async function stopCurrentSession(runner: GodotRunner): Promise<HandlerResult> {
-  const result = await runner.stopProject();
+async function stopCurrentSession(
+  runner: GodotRunner,
+  target?: { projectPath: string; instance: number },
+): Promise<HandlerResult> {
+  const stoppingInstance = target?.instance ?? runner.getCurrentSessionInfo()?.instance ?? 0;
+  const result =
+    target === undefined
+      ? await runner.stopProject()
+      : await runner.stopInstance(target.projectPath, target.instance);
+  const described = await describeStopResult(runner, result);
+  // A stop of a named instance is tagged by its caller.
+  return result !== null && target === undefined && stoppingInstance > 0
+    ? tagWithInstance(described, stoppingInstance)
+    : described;
+}
 
+async function describeStopResult(
+  runner: GodotRunner,
+  result: Awaited<ReturnType<GodotRunner['stopProject']>>,
+): Promise<HandlerResult> {
   if (!result) {
     const others = otherLiveSessionsClause(runner.getRuntimeSessionStatus());
     return err(
@@ -1765,7 +2155,9 @@ export function handleTakeScreenshot(
   args: OperationParams,
 ): Promise<HandlerResult> {
   // The session the gate admitted is the one the command goes to.
-  return runSessionExclusive(runner, 'take_screenshot', () => takeScreenshot(runner, args));
+  return runSessionExclusive(runner, 'take_screenshot', () =>
+    onInstanceTarget(runner, args, () => takeScreenshot(runner, args)),
+  );
 }
 
 async function takeScreenshot(runner: GodotRunner, args: OperationParams): Promise<HandlerResult> {
@@ -2099,7 +2491,9 @@ export function handleSimulateInput(
   args: OperationParams,
 ): Promise<HandlerResult> {
   // The capture window opened for this batch must not receive another call's boundaries.
-  return runSessionExclusive(runner, 'simulate_input', () => simulateInput(runner, args));
+  return runSessionExclusive(runner, 'simulate_input', () =>
+    onInstanceTarget(runner, args, () => simulateInput(runner, args)),
+  );
 }
 
 async function simulateInput(runner: GodotRunner, args: OperationParams): Promise<HandlerResult> {
@@ -2236,7 +2630,9 @@ export function handleGetUiElements(
   runner: GodotRunner,
   args: OperationParams,
 ): Promise<HandlerResult> {
-  return runSessionExclusive(runner, 'get_ui_elements', () => queryUiElements(runner, args));
+  return runSessionExclusive(runner, 'get_ui_elements', () =>
+    onInstanceTarget(runner, args, () => queryUiElements(runner, args)),
+  );
 }
 
 /** Most Control paths named in the non-finite rect warning; the rest are counted. */
@@ -2355,10 +2751,22 @@ export async function handleRunScript(
 ): Promise<HandlerResult> {
   args = normalizeParameters(args);
 
+  // A named run instance is selected in a turn of its own; the turn that runs the script checks it is still the current one.
+  const instanceArg = parseInstanceArg(args);
+  if (!instanceArg.ok) return instanceArg;
+  if (instanceArg.value !== undefined) {
+    const selected = await runSessionExclusive(runner, 'run_script (select instance)', async () => {
+      const picked = selectInstanceTarget(runner, args);
+      return picked.ok ? ok({ content: [] }) : picked;
+    });
+    if (!selected.ok) return selected;
+  }
+
   const wording = runtimeToolWording('execute scripts');
   const session = requireRuntimeSession(runner, wording);
   if (!session.ok) return session;
   const sessionProjectPath = session.value.projectPath;
+  const sessionInstance = session.value.instance ?? 0;
   // Captured with the path: the session is re-checked once the turn comes, and the payload reports this one.
   const sessionMode = session.value.mode;
   const tip = sessionMode === 'attached' ? RUN_SCRIPT_TIP_ATTACHED : RUN_SCRIPT_TIP;
@@ -2399,6 +2807,7 @@ export async function handleRunScript(
       if (!current.ok) return current;
       if (
         sessionKey(current.value.projectPath) !== sessionKey(sessionProjectPath) ||
+        (current.value.instance ?? 0) !== sessionInstance ||
         current.value.mode !== sessionMode
       ) {
         return err(
